@@ -3,7 +3,7 @@
 cd ../../../data
 
 # Clone OpenMoji repo without checking out files
-git clone --no-checkout https://github.com/hfg-gmuend/openmoji.git openmoji-lite
+git clone --no-checkout https://github.com/hfg-gmuend/openmoji.git openmoji
 
 # Go inside the folder
 cd openmoji-lite || exit
@@ -19,4 +19,4 @@ git checkout
 
 echo "✅ Done! Only 'color', 'data', and 'src' folders were cloned into openmoji-lite/"
 
-cd ../src/dataset_creation/openmoji
+cd ../../src/dataset_creation/openmoji
