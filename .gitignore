@@ -1,0 +1,14 @@
+# Ignore everything inside data/
+data/*
+
+# keep folders of datasets
+!data/.gitkeep
+!data/arasaac/.gitkeep
+!data/lds/.gitkeep
+!data/icon645/.gitkeep
+!data/openmoji/.gitkeep
+!data/quickdraw/.gitkeep
+!data/the_noun_project/.gitkeep
+
+
+.venv/*
