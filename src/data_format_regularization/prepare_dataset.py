@@ -42,45 +42,49 @@ def setup_training_directory():
 def process_arasaac(all_metadata: List[Dict[str, Any]], save_interval: int = 100) -> Tuple[List[Dict[str, Any]], int]:
     """
     Process ARASAAC dataset.
-    Returns list of metadata entries in standardized format.
+    Returns (list of metadata entries, copied_count).
     """
     print("\n[ARASAAC] Processing dataset...")
 
     metadata_file = ARASAAC_DIR / "metadata.json"
     if not metadata_file.exists():
         print(f"[WARN] ARASAAC metadata not found at {metadata_file}")
-        return []
+        return [], 0  # <-- return tuple
 
-    # Load metadata
+    # Load metadata (mapping id -> record)
     with open(metadata_file, 'r', encoding='utf-8') as f:
         metadata = json.load(f)
 
-    processed_data = []
+    processed_data: List[Dict[str, Any]] = []
     copied_count = 0
 
     for i, (pic_id, meta) in enumerate(metadata.items(), 1):
-        image_file = meta.get("image_file")
+        # ARASAAC uses "file_name"
+        image_file = meta.get("image_file") or meta.get("file_name") or meta.get("filename")
         if not image_file:
             continue
 
         source_path = ARASAAC_DIR / image_file
         if not source_path.exists():
-            continue
+            # Some dumps place images in a subdir; try one fallback
+            alt = ARASAAC_DIR / "images" / image_file
+            if alt.exists():
+                source_path = alt
+            else:
+                continue
 
-        # Prepend dataset name to keep filenames unique
-        file_extension = source_path.suffix
-        new_filename = f"arasaac_{source_path.stem}{file_extension}"
+        # Prepend dataset name for uniqueness
+        new_filename = f"arasaac_{Path(image_file).stem}{Path(image_file).suffix}"
         dest_path = TRAINING_DIR / "images" / new_filename
 
-        # Copy image
         try:
-            move_preserve_meta(source_path, dest_path)   # moves, i.e., copy then delete original
+            move_preserve_meta(source_path, dest_path)
             copied_count += 1
         except Exception as e:
             print(f"[WARN] Failed to transfer {source_path} -> {dest_path}: {e}")
             continue
 
-        # Create standardized metadata entry
+        # Normalize fields
         keywords = meta.get("keywords", [])
         if isinstance(keywords, str):
             keywords = [k.strip() for k in keywords.split("|") if k.strip()]
@@ -92,21 +96,21 @@ def process_arasaac(all_metadata: List[Dict[str, Any]], save_interval: int = 100
         entry = {
             "dataset": "arasaac",
             "image_file": new_filename,
-            "id": pic_id,
+            "id": pic_id,                              # keep the outer key
             "title": meta.get("title"),
             "keywords": keywords,
             "categories": categories,
-            "license": meta.get("license", "CC BY-NC-SA 4.0")
+            "license": meta.get("license", "CC BY-NC-SA 4.0"),
         }
         processed_data.append(entry)
 
-        # Periodic save
-        if i % save_interval == 0:
+        if copied_count % save_interval == 0:
             save_metadata(all_metadata + processed_data)
             print(f"[ARASAAC] Checkpoint: {copied_count} images processed")
 
     print(f"[ARASAAC] Processed {copied_count} images")
     return processed_data, copied_count
+
 
 def process_icon645(all_metadata: List[Dict[str, Any]], save_interval: int = 100) -> Tuple[List[Dict[str, Any]], int]:
     """
@@ -118,7 +122,7 @@ def process_icon645(all_metadata: List[Dict[str, Any]], save_interval: int = 100
     icons_dir = ICON645_DIR / "colored_icons_final"
     if not icons_dir.exists():
         print(f"[WARN] ICON645 directory not found at {icons_dir}")
-        return []
+        return [], 0
 
     processed_data = []
     copied_count = 0
@@ -138,10 +142,10 @@ def process_icon645(all_metadata: List[Dict[str, Any]], save_interval: int = 100
 
             # Copy image
             try:
-                move_preserve_meta(source_path, dest_path)   # moves, i.e., copy then delete original
+                move_preserve_meta(image_file, dest_path)
                 copied_count += 1
             except Exception as e:
-                print(f"[WARN] Failed to transfer {source_path} -> {dest_path}: {e}")
+                print(f"[WARN] Failed to transfer {image_file} -> {dest_path}: {e}")
                 continue
 
 
@@ -177,7 +181,7 @@ def process_lds(all_metadata: List[Dict[str, Any]], save_interval: int = 100) ->
 
     if not LDS_DIR.exists():
         print(f"[WARN] LDS directory not found at {LDS_DIR}")
-        return []
+        return [], 0
 
     processed_data = []
     copied_count = 0
@@ -190,10 +194,10 @@ def process_lds(all_metadata: List[Dict[str, Any]], save_interval: int = 100) ->
 
         # Copy image
         try:
-            move_preserve_meta(source_path, dest_path)   # moves, i.e., copy then delete original
+            move_preserve_meta(image_file, dest_path)
             copied_count += 1
         except Exception as e:
-            print(f"[WARN] Failed to transfer {source_path} -> {dest_path}: {e}")
+            print(f"[WARN] Failed to transfer {image_file} -> {dest_path}: {e}")
             continue
 
 
@@ -245,8 +249,8 @@ def process_openmoji(all_metadata: List[Dict[str, Any]], save_interval: int = 10
         images_dir = OPENMOJI_DIR / "color" / "72x72"
         if not images_dir.exists():
             print(f"[WARN] OpenMoji images directory not found")
-            return []
-
+            return [], 0
+            
     processed_data = []
     copied_count = 0
 
@@ -267,10 +271,10 @@ def process_openmoji(all_metadata: List[Dict[str, Any]], save_interval: int = 10
 
         # Copy image
         try:
-            move_preserve_meta(source_path, dest_path)   # moves, i.e., copy then delete original
+            move_preserve_meta(image_file, dest_path)   # moves, i.e., copy then delete original
             copied_count += 1
         except Exception as e:
-            print(f"[WARN] Failed to transfer {source_path} -> {dest_path}: {e}")
+            print(f"[WARN] Failed to transfer {image_file} -> {dest_path}: {e}")
             continue
 
 
