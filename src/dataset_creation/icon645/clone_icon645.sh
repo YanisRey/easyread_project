@@ -3,7 +3,9 @@ set -euo pipefail
 
 # Resolve this script's directory so the relative path works from anywhere
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-OUT_DIR="$SCRIPT_DIR/../../../data/icon645"
+
+# SPECIFY output dir
+OUT_DIR="/work/scratch/ndickenmann/icon645"
 ZIP_URL="https://iconqa2021.s3.us-west-1.amazonaws.com/icon645.zip"
 ZIP_PATH="$OUT_DIR/icon645.zip"
 

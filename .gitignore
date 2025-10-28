@@ -11,4 +11,9 @@ data/*
 !data/the_noun_project/.gitkeep
 
 
-.venv/*
+venv/*
+
+#log and error files
+*.log
+*.out
+*.err

@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Dataset Preparation Script
+Dataset Preparation Script (MERGE MODE)
 Integrates multiple icon/pictogram datasets (arasaac, icon645, lds, openmoji)
 into a unified training_data directory with standardized naming.
+
+Key behaviors:
+- Loads existing metadata.json (if present) and MERGES new entries into it.
+- Deduplicates by (dataset, image_file).
+- Avoids filename collisions in training_data/images via auto-renaming (_1, _2, ...).
+- Writes metadata once at the end (with .bak backups of old files).
+- NEW: Includes source subfolder names in output filenames to avoid collisions.
 """
 
 import json
 import shutil
 from pathlib import Path
 import csv
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Tuple
 import os
 
-# Base paths
+# ------------------------- Base paths -------------------------
 DATA_DIR = (Path(__file__).resolve().parent / "../../data").resolve()
 TRAINING_DIR = DATA_DIR / "training_data"
 
@@ -21,9 +28,10 @@ TRAINING_DIR = DATA_DIR / "training_data"
 ARASAAC_DIR = DATA_DIR / "arasaac"
 ICON645_DIR = DATA_DIR / "icon645"
 LDS_DIR = DATA_DIR / "lds"
-OPENMOJI_DIR = DATA_DIR / "openmoji" / "openmoji-lite"
+OPENMOJI_DIR = DATA_DIR / "openmoji"
 
 
+# ------------------------- Helpers -------------------------
 def move_preserve_meta(src: Path, dst: Path) -> None:
     """
     Move file from src to dst.
@@ -33,89 +41,167 @@ def move_preserve_meta(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst))
 
+
 def setup_training_directory():
     """Create training_data directory structure."""
     TRAINING_DIR.mkdir(parents=True, exist_ok=True)
     (TRAINING_DIR / "images").mkdir(exist_ok=True)
     print(f"[INFO] Training directory set up at: {TRAINING_DIR}")
 
-def process_arasaac(all_metadata: List[Dict[str, Any]], save_interval: int = 100) -> Tuple[List[Dict[str, Any]], int]:
+
+def load_existing_metadata() -> List[Dict[str, Any]]:
+    """Load existing metadata.json if present; otherwise return empty list."""
+    json_path = TRAINING_DIR / "metadata.json"
+    if json_path.exists():
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def build_existing_keys(meta: List[Dict[str, Any]]) -> set:
+    """Build a set of (dataset, image_file) for fast deduplication."""
+    keys = set()
+    for e in meta:
+        ds = e.get("dataset")
+        img = e.get("image_file")
+        if ds and img:
+            keys.add((ds, img))
+    return keys
+
+
+def unique_dest(path: Path) -> Path:
     """
-    Process ARASAAC dataset.
-    Returns (list of metadata entries, copied_count).
+    Return a non-colliding destination path by appending _1, _2, ... if needed.
+    Ensures we never overwrite an existing file in images/.
+    """
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    k = 1
+    while True:
+        cand = path.with_name(f"{stem}_{k}{suffix}")
+        if not cand.exists():
+            return cand
+        k += 1
+
+
+def _clean_part(s: str) -> str:
+    """Sanitize a path component for filenames: keep alnum, '-', '_', '.'; replace others with '-'."""
+    return "".join(ch if (ch.isalnum() or ch in "-_.") else "-" for ch in s)
+
+
+def subfolder_suffix(src_file: Path, root: Path, strip_first: str | None = None) -> str:
+    """
+    Build a suffix like '_animals_cats' from subfolders of src_file relative to root.
+    - If strip_first is provided and matches the first relative component, drop it
+      (e.g., 'images' or 'colored_icons_final').
+    """
+    try:
+        rel = src_file.relative_to(root)
+    except ValueError:
+        return ""  # src not under root; no suffix
+    parts = list(rel.parts[:-1])  # parents only, no filename
+    if parts and strip_first and parts[0] == strip_first:
+        parts = parts[1:]
+    parts = [_clean_part(p) for p in parts if p and p != "."]
+    return ("_" + "_".join(parts)) if parts else ""
+
+
+# ------------------------- Dataset processors (MERGE-SAFE) -------------------------
+def process_arasaac(
+    all_metadata: List[Dict[str, Any]],
+    existing_keys: set,
+    save_interval: int = 1000
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Process ARASAAC dataset and append only new entries (merge-safe).
+    Returns (new_entries, moved_count).
     """
     print("\n[ARASAAC] Processing dataset...")
 
     metadata_file = ARASAAC_DIR / "metadata.json"
     if not metadata_file.exists():
         print(f"[WARN] ARASAAC metadata not found at {metadata_file}")
-        return [], 0  # <-- return tuple
+        return [], 0
 
-    # Load metadata (mapping id -> record)
     with open(metadata_file, 'r', encoding='utf-8') as f:
-        metadata = json.load(f)
+        metadata = json.load(f)  # expected mapping: pic_id -> meta dict
 
     processed_data: List[Dict[str, Any]] = []
-    copied_count = 0
+    moved_count = 0
 
     for i, (pic_id, meta) in enumerate(metadata.items(), 1):
-        # ARASAAC uses "file_name"
         image_file = meta.get("image_file") or meta.get("file_name") or meta.get("filename")
         if not image_file:
             continue
 
         source_path = ARASAAC_DIR / image_file
         if not source_path.exists():
-            # Some dumps place images in a subdir; try one fallback
             alt = ARASAAC_DIR / "images" / image_file
             if alt.exists():
                 source_path = alt
             else:
                 continue
 
-        # Prepend dataset name for uniqueness
-        new_filename = f"arasaac_{Path(image_file).stem}{Path(image_file).suffix}"
-        dest_path = TRAINING_DIR / "images" / new_filename
+        # Include subfolders relative to ARASAAC root, dropping leading 'images' if present
+        sub_sfx = subfolder_suffix(source_path, ARASAAC_DIR, strip_first="images")
+        stem, suffix = Path(image_file).stem, Path(image_file).suffix
+        new_filename = f"arasaac{sub_sfx}_{_clean_part(stem)}{suffix}"
 
-        try:
-            move_preserve_meta(source_path, dest_path)
-            copied_count += 1
-        except Exception as e:
-            print(f"[WARN] Failed to transfer {source_path} -> {dest_path}: {e}")
+        dest_path = unique_dest(TRAINING_DIR / "images" / new_filename)
+        final_filename = dest_path.name
+        key = ("arasaac", final_filename)
+
+        # Skip if already present and the file exists
+        if key in existing_keys and dest_path.exists():
             continue
 
-        # Normalize fields
-        keywords = meta.get("keywords", [])
-        if isinstance(keywords, str):
-            keywords = [k.strip() for k in keywords.split("|") if k.strip()]
+        # Move file if needed
+        if not dest_path.exists():
+            try:
+                move_preserve_meta(source_path, dest_path)
+                moved_count += 1
+            except Exception as e:
+                print(f"[WARN] Failed to transfer {source_path} -> {dest_path}: {e}")
+                continue
 
-        categories = meta.get("categories", [])
-        if isinstance(categories, str):
-            categories = [c.strip() for c in categories.split("|") if c.strip()]
+        # Append metadata if new
+        if key not in existing_keys:
+            keywords = meta.get("keywords", [])
+            if isinstance(keywords, str):
+                keywords = [k.strip() for k in keywords.split("|") if k.strip()]
 
-        entry = {
-            "dataset": "arasaac",
-            "image_file": new_filename,
-            "id": pic_id,                              # keep the outer key
-            "title": meta.get("title"),
-            "keywords": keywords,
-            "categories": categories,
-            "license": meta.get("license", "CC BY-NC-SA 4.0"),
-        }
-        processed_data.append(entry)
+            categories = meta.get("categories", [])
+            if isinstance(categories, str):
+                categories = [c.strip() for c in categories.split("|") if c.strip()]
 
-        if copied_count % save_interval == 0:
-            save_metadata(all_metadata + processed_data)
-            print(f"[ARASAAC] Checkpoint: {copied_count} images processed")
+            entry = {
+                "dataset": "arasaac",
+                "image_file": final_filename,
+                "id": pic_id,
+                "title": meta.get("title"),
+                "keywords": keywords,
+                "categories": categories,
+                "license": meta.get("license", "CC BY-NC-SA 4.0"),
+            }
+            processed_data.append(entry)
+            existing_keys.add(key)
 
-    print(f"[ARASAAC] Processed {copied_count} images")
-    return processed_data, copied_count
+        if i % save_interval == 0:
+            print(f"[ARASAAC] Checkpoint: {moved_count} files moved so far")
+
+    print(f"[ARASAAC] New entries: {len(processed_data)} | Files moved: {moved_count}")
+    return processed_data, moved_count
 
 
-def process_icon645(all_metadata: List[Dict[str, Any]], save_interval: int = 100) -> Tuple[List[Dict[str, Any]], int]:
+def process_icon645(
+    all_metadata: List[Dict[str, Any]],
+    existing_keys: set,
+    save_interval: int = 1000
+) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Process ICON645 dataset.
-    Returns list of metadata entries in standardized format.
+    Process ICON645 dataset and append only new entries (merge-safe).
+    Returns (new_entries, moved_count).
     """
     print("\n[ICON645] Processing dataset...")
 
@@ -124,58 +210,67 @@ def process_icon645(all_metadata: List[Dict[str, Any]], save_interval: int = 100
         print(f"[WARN] ICON645 directory not found at {icons_dir}")
         return [], 0
 
-    processed_data = []
-    copied_count = 0
+    processed_data: List[Dict[str, Any]] = []
+    moved_count = 0
+    i = 0
 
-    # Iterate through category directories
     for category_dir in icons_dir.iterdir():
         if not category_dir.is_dir():
             continue
 
-        category_name = category_dir.name
-
-        # Process all PNG images in the category
         for image_file in category_dir.glob("*.png"):
-            # Prepend dataset name to keep filenames unique
-            new_filename = f"icon645_{image_file.name}"
-            dest_path = TRAINING_DIR / "images" / new_filename
+            i += 1
+            # Include subfolders relative to ICON645 root, dropping 'colored_icons_final'
+            sub_sfx = subfolder_suffix(image_file, ICON645_DIR, strip_first="colored_icons_final")
+            stem, suffix = image_file.stem, image_file.suffix
+            new_filename = f"icon645{sub_sfx}_{_clean_part(stem)}{suffix}"
 
-            # Copy image
-            try:
-                move_preserve_meta(image_file, dest_path)
-                copied_count += 1
-            except Exception as e:
-                print(f"[WARN] Failed to transfer {image_file} -> {dest_path}: {e}")
+            dest_path = unique_dest(TRAINING_DIR / "images" / new_filename)
+            final_filename = dest_path.name
+            key = ("icon645", final_filename)
+
+            if key in existing_keys and dest_path.exists():
                 continue
 
+            if not dest_path.exists():
+                try:
+                    move_preserve_meta(image_file, dest_path)
+                    moved_count += 1
+                except Exception as e:
+                    print(f"[WARN] Failed to transfer {image_file} -> {dest_path}: {e}")
+                    continue
 
-            # Extract label from filename (icon ID)
-            icon_id = image_file.stem
+            if key not in existing_keys:
+                # category is encoded in filename already; still keep metadata fields
+                category_name = category_dir.name
+                icon_id = image_file.stem
+                entry = {
+                    "dataset": "icon645",
+                    "image_file": final_filename,
+                    "id": icon_id,
+                    "title": category_name,
+                    "keywords": [category_name],
+                    "categories": [category_name],
+                    "license": "CC BY-NC-SA 4.0"
+                }
+                processed_data.append(entry)
+                existing_keys.add(key)
 
-            entry = {
-                "dataset": "icon645",
-                "image_file": new_filename,
-                "id": icon_id,
-                "title": category_name,
-                "keywords": [category_name],
-                "categories": [category_name],
-                "license": "CC BY-NC-SA 4.0"
-            }
-            processed_data.append(entry)
+            if i % save_interval == 0:
+                print(f"[ICON645] Checkpoint: {moved_count} files moved so far")
 
-            # Periodic save
-            if copied_count % save_interval == 0:
-                save_metadata(all_metadata + processed_data)
-                print(f"[ICON645] Checkpoint: {copied_count} images processed")
-
-    print(f"[ICON645] Processed {copied_count} images")
-    return processed_data, copied_count
+    print(f"[ICON645] New entries: {len(processed_data)} | Files moved: {moved_count}")
+    return processed_data, moved_count
 
 
-def process_lds(all_metadata: List[Dict[str, Any]], save_interval: int = 100) -> Tuple[List[Dict[str, Any]], int]:
+def process_lds(
+    all_metadata: List[Dict[str, Any]],
+    existing_keys: set,
+    save_interval: int = 1000
+) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Process LDS (Learning Design Symbols) dataset.
-    Returns list of metadata entries in standardized format.
+    Process LDS dataset and append only new entries (merge-safe).
+    Returns (new_entries, moved_count).
     """
     print("\n[LDS] Processing dataset...")
 
@@ -183,248 +278,252 @@ def process_lds(all_metadata: List[Dict[str, Any]], save_interval: int = 100) ->
         print(f"[WARN] LDS directory not found at {LDS_DIR}")
         return [], 0
 
-    processed_data = []
-    copied_count = 0
+    processed_data: List[Dict[str, Any]] = []
+    moved_count = 0
 
-    # Process all PNG images in LDS directory
-    for image_file in LDS_DIR.glob("*.png"):
-        # Prepend dataset name to keep filenames unique
-        new_filename = f"lds_{image_file.name}"
-        dest_path = TRAINING_DIR / "images" / new_filename
+    for i, image_file in enumerate(LDS_DIR.glob("*.png"), 1):
+        # No subfolders in LDS (flat), keep as before
+        new_filename = f"lds_{_clean_part(image_file.stem)}{image_file.suffix}"
+        dest_path = unique_dest(TRAINING_DIR / "images" / new_filename)
+        final_filename = dest_path.name
+        key = ("lds", final_filename)
 
-        # Copy image
-        try:
-            move_preserve_meta(image_file, dest_path)
-            copied_count += 1
-        except Exception as e:
-            print(f"[WARN] Failed to transfer {image_file} -> {dest_path}: {e}")
+        if key in existing_keys and dest_path.exists():
             continue
 
+        if not dest_path.exists():
+            try:
+                move_preserve_meta(image_file, dest_path)
+                moved_count += 1
+            except Exception as e:
+                print(f"[WARN] Failed to transfer {image_file} -> {dest_path}: {e}")
+                continue
 
-        # Extract label from filename (remove .png and clean up)
-        label = image_file.stem
-        # Convert filename to readable keywords (e.g., "1-hour" -> ["1", "hour"])
-        keywords = [kw.strip() for kw in label.replace("-", " ").replace("_", " ").split()]
+        if key not in existing_keys:
+            label = image_file.stem
+            keywords = [kw.strip() for kw in label.replace("-", " ").replace("_", " ").split()]
+            entry = {
+                "dataset": "lds",
+                "image_file": final_filename,
+                "id": label,
+                "title": label.replace("-", " ").replace("_", " "),
+                "keywords": keywords,
+                "categories": ["lds"],
+                "license": "Learning Design Symbols"
+            }
+            processed_data.append(entry)
+            existing_keys.add(key)
 
-        entry = {
-            "dataset": "lds",
-            "image_file": new_filename,
-            "id": label,
-            "title": label.replace("-", " ").replace("_", " "),
-            "keywords": keywords,
-            "categories": ["lds"],
-            "license": "Learning Design Symbols"
-        }
-        processed_data.append(entry)
+        if i % save_interval == 0:
+            print(f"[LDS] Checkpoint: {moved_count} files moved so far")
 
-        # Periodic save
-        if copied_count % save_interval == 0:
-            save_metadata(all_metadata + processed_data)
-            print(f"[LDS] Checkpoint: {copied_count} images processed")
-
-    print(f"[LDS] Processed {copied_count} images")
-    return processed_data, copied_count
+    print(f"[LDS] New entries: {len(processed_data)} | Files moved: {moved_count}")
+    return processed_data, moved_count
 
 
-def process_openmoji(all_metadata: List[Dict[str, Any]], save_interval: int = 100) -> Tuple[List[Dict[str, Any]], int]:
+def process_openmoji(
+    all_metadata: List[Dict[str, Any]],
+    existing_keys: set,
+    save_interval: int = 1000
+) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Process OpenMoji dataset.
-    Returns list of metadata entries in standardized format.
+    Process OpenMoji dataset and append only new entries (merge-safe).
+    Returns (new_entries, moved_count).
     """
     print("\n[OPENMOJI] Processing dataset...")
 
-    # Load OpenMoji metadata
     metadata_file = OPENMOJI_DIR / "data" / "openmoji.json"
     if not metadata_file.exists():
         print(f"[WARN] OpenMoji metadata not found at {metadata_file}")
-        return []
+        return [], 0
 
     with open(metadata_file, 'r', encoding='utf-8') as f:
         metadata_list = json.load(f)
 
-    # We'll use the 618x618 PNG color images
+    # Prefer 618x618, fallback to 72x72
     images_dir = OPENMOJI_DIR / "color" / "618x618"
     if not images_dir.exists():
-        # Try alternative path
         images_dir = OPENMOJI_DIR / "color" / "72x72"
         if not images_dir.exists():
             print(f"[WARN] OpenMoji images directory not found")
             return [], 0
-            
-    processed_data = []
-    copied_count = 0
 
-    # Create a mapping from hexcode to metadata
-    meta_map = {}
+    meta_map: Dict[str, Dict[str, Any]] = {}
     for item in metadata_list:
         hexcode = item.get("hexcode")
         if hexcode:
             meta_map[hexcode] = item
 
-    # Process all PNG images
-    for image_file in images_dir.glob("*.png"):
+    processed_data: List[Dict[str, Any]] = []
+    moved_count = 0
+
+    for i, image_file in enumerate(images_dir.glob("*.png"), 1):
+        # OpenMoji images are flat inside images_dir; no meaningful subfolders here
         hexcode = image_file.stem
+        new_filename = f"openmoji_{_clean_part(hexcode)}{image_file.suffix}"
+        dest_path = unique_dest(TRAINING_DIR / "images" / new_filename)
+        final_filename = dest_path.name
+        key = ("openmoji", final_filename)
 
-        # Prepend dataset name to keep filenames unique
-        new_filename = f"openmoji_{image_file.name}"
-        dest_path = TRAINING_DIR / "images" / new_filename
-
-        # Copy image
-        try:
-            move_preserve_meta(image_file, dest_path)   # moves, i.e., copy then delete original
-            copied_count += 1
-        except Exception as e:
-            print(f"[WARN] Failed to transfer {image_file} -> {dest_path}: {e}")
+        if key in existing_keys and dest_path.exists():
             continue
 
+        if not dest_path.exists():
+            try:
+                move_preserve_meta(image_file, dest_path)
+                moved_count += 1
+            except Exception as e:
+                print(f"[WARN] Failed to transfer {image_file} -> {dest_path}: {e}")
+                continue
 
-        # Get metadata if available
-        meta = meta_map.get(hexcode, {})
-        annotation = meta.get("annotation", hexcode)
-        tags = meta.get("tags", "")
-        openmoji_tags = meta.get("openmoji_tags", "")
-        group = meta.get("group", "")
-        subgroups = meta.get("subgroups", "")
+        if key not in existing_keys:
+            meta = meta_map.get(hexcode, {})
+            annotation = meta.get("annotation", hexcode)
+            tags = meta.get("tags", "")
+            openmoji_tags = meta.get("openmoji_tags", "")
+            group = meta.get("group", "")
+            subgroups = meta.get("subgroups", "")
 
-        # Combine all tags
-        all_tags = []
-        if tags:
-            all_tags.extend([t.strip() for t in tags.split(",") if t.strip()])
-        if openmoji_tags:
-            all_tags.extend([t.strip() for t in openmoji_tags.split(",") if t.strip()])
+            all_tags: List[str] = []
+            if tags:
+                all_tags += [t.strip() for t in tags.split(",") if t.strip()]
+            if openmoji_tags:
+                all_tags += [t.strip() for t in openmoji_tags.split(",") if t.strip()]
 
-        # Add group/subgroup info
-        categories = []
-        if group:
-            categories.append(group)
-        if subgroups:
-            categories.append(subgroups)
+            categories: List[str] = []
+            if group:
+                categories.append(group)
+            if subgroups:
+                categories.append(subgroups)
 
-        entry = {
-            "dataset": "openmoji",
-            "image_file": new_filename,
-            "id": hexcode,
-            "title": annotation,
-            "keywords": all_tags if all_tags else [annotation],
-            "categories": categories if categories else ["emoji"],
-            "license": "CC BY-SA 4.0"
-        }
-        processed_data.append(entry)
+            entry = {
+                "dataset": "openmoji",
+                "image_file": final_filename,
+                "id": hexcode,
+                "title": annotation,
+                "keywords": all_tags if all_tags else [annotation],
+                "categories": categories if categories else ["emoji"],
+                "license": "CC BY-SA 4.0"
+            }
+            processed_data.append(entry)
+            existing_keys.add(key)
 
-        # Periodic save
-        if copied_count % save_interval == 0:
-            save_metadata(all_metadata + processed_data)
-            print(f"[OPENMOJI] Checkpoint: {copied_count} images processed")
+        if i % save_interval == 0:
+            print(f"[OPENMOJI] Checkpoint: {moved_count} files moved so far")
 
-    print(f"[OPENMOJI] Processed {copied_count} images")
-    return processed_data, copied_count
+    print(f"[OPENMOJI] New entries: {len(processed_data)} | Files moved: {moved_count}")
+    return processed_data, moved_count
 
 
-def save_metadata(all_metadata: List[Dict[str, Any]]):
-    """Save combined metadata to JSON and CSV formats."""
-
-    # Save as JSON
+# ------------------------- Metadata I/O -------------------------
+def save_metadata_with_backup(all_metadata: List[Dict[str, Any]]):
+    """Backup existing metadata.* then write fresh JSON and CSV from all_metadata."""
     json_path = TRAINING_DIR / "metadata.json"
+    csv_path = TRAINING_DIR / "metadata.csv"
+
+    # Backups
+    if json_path.exists():
+        shutil.copy2(json_path, json_path.with_suffix(".json.bak"))
+        print(f"[INFO] Backup saved: {json_path.with_suffix('.json.bak').name}")
+    if csv_path.exists():
+        shutil.copy2(csv_path, csv_path.with_suffix(".csv.bak"))
+        print(f"[INFO] Backup saved: {csv_path.with_suffix('.csv.bak').name}")
+
+    # JSON
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(all_metadata, f, ensure_ascii=False, indent=2)
-    print(f"\n[INFO] Saved metadata JSON to: {json_path}")
+    print(f"[INFO] Saved metadata JSON to: {json_path}")
 
-    # Save as CSV
-    csv_path = TRAINING_DIR / "metadata.csv"
+    # CSV
     if all_metadata:
         fieldnames = ["dataset", "image_file", "id", "title", "keywords", "categories", "license"]
-
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-
             for entry in all_metadata:
                 row = entry.copy()
-                # Convert lists to pipe-separated strings for CSV
                 if isinstance(row.get("keywords"), list):
                     row["keywords"] = "|".join(row["keywords"])
                 if isinstance(row.get("categories"), list):
                     row["categories"] = "|".join(row["categories"])
                 writer.writerow(row)
-
         print(f"[INFO] Saved metadata CSV to: {csv_path}")
 
 
 def generate_statistics(all_metadata: List[Dict[str, Any]]):
     """Generate and print statistics about the combined dataset."""
-
     print("\n" + "="*60)
     print("DATASET STATISTICS")
     print("="*60)
 
-    # Count by dataset
-    dataset_counts = {}
+    dataset_counts: Dict[str, int] = {}
     for entry in all_metadata:
         dataset = entry.get("dataset", "unknown")
         dataset_counts[dataset] = dataset_counts.get(dataset, 0) + 1
 
-    print(f"\nTotal images: {len(all_metadata)}")
+    print(f"\nTotal images in metadata: {len(all_metadata):,}")
     print("\nBreakdown by dataset:")
     for dataset, count in sorted(dataset_counts.items()):
         print(f"  {dataset:15s}: {count:6,d} images")
 
-    # Collect all unique categories
     all_categories = set()
     for entry in all_metadata:
         cats = entry.get("categories", [])
         if isinstance(cats, list):
             all_categories.update(cats)
 
-    print(f"\nTotal unique categories: {len(all_categories)}")
+    print(f"\nTotal unique categories: {len(all_categories):,}")
     print("="*60 + "\n")
 
 
+# ------------------------- Main -------------------------
 def main():
-    """Main function to orchestrate dataset preparation and space-saving moves."""
+    """Main function to orchestrate dataset preparation in MERGE mode."""
     print("=" * 60)
-    print("PREPARING COMBINED DATASET")
+    print("PREPARING COMBINED DATASET (MERGE MODE)")
     print("=" * 60)
 
-    # Setup output directory
     setup_training_directory()
 
-    # Accumulate metadata and total transfer count
-    all_metadata: List[Dict[str, Any]] = []
+    # Load existing metadata and prepare dedup keys
+    all_metadata: List[Dict[str, Any]] = load_existing_metadata()
+    existing_keys = build_existing_keys(all_metadata)
     grand_total = 0
 
-    # ---- Process ARASAAC ----
-    dataset_data, n = process_arasaac(all_metadata, save_interval=100)
+    
+
+    # # ICON645
+    # dataset_data, n = process_icon645(all_metadata, existing_keys, save_interval=1000)
+    # all_metadata.extend(dataset_data)
+    # grand_total += n
+
+    # # LDS
+    # dataset_data, n = process_lds(all_metadata, existing_keys, save_interval=1000)
+    # all_metadata.extend(dataset_data)
+    # grand_total += n
+
+    # OPENMOJI
+    dataset_data, n = process_openmoji(all_metadata, existing_keys, save_interval=1000)
     all_metadata.extend(dataset_data)
     grand_total += n
-    save_metadata(all_metadata)
+    
+    # # ARASAAC
+    # dataset_data, n = process_arasaac(all_metadata, existing_keys, save_interval=1000)
+    # all_metadata.extend(dataset_data)
+    # grand_total += n
+    
 
-    # ---- Process ICON645 ----
-    dataset_data, n = process_icon645(all_metadata, save_interval=100)
-    all_metadata.extend(dataset_data)
-    grand_total += n
-    save_metadata(all_metadata)
+    # Final save (with backups)
+    save_metadata_with_backup(all_metadata)
 
-    # ---- Process LDS ----
-    dataset_data, n = process_lds(all_metadata, save_interval=100)
-    all_metadata.extend(dataset_data)
-    grand_total += n
-    save_metadata(all_metadata)
-
-    # ---- Process OPENMOJI ----
-    dataset_data, n = process_openmoji(all_metadata, save_interval=100)
-    all_metadata.extend(dataset_data)
-    grand_total += n
-
-    # ---- Final save and summary ----
-    save_metadata(all_metadata)
+    # Stats
     generate_statistics(all_metadata)
 
     print("=" * 60)
-    print(f"[SUCCESS] Dataset preparation complete!")
+    print(f"[SUCCESS] Merge complete!")
     print(f"[INFO] Training data location: {TRAINING_DIR}")
-    print(f"[INFO] Total images transferred (originals deleted): {grand_total:,}")
+    print(f"[INFO] Files moved this run: {grand_total:,}")
     print("=" * 60)
-
 
 
 if __name__ == "__main__":

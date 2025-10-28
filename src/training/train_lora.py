@@ -18,16 +18,18 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from peft import LoraConfig, get_peft_model
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+import wandb
 
 
 class FullDataset(Dataset):
     """Dataset for ARASAAC pictograms with captions."""
 
-    def __init__(self, data_dir, tokenizer, size=512):
+    def __init__(self, data_dir, tokenizer, size=512, instance_token="sks"):
         self.data_dir = Path(data_dir)
         self.images_dir = self.data_dir / "images"
         self.size = size
         self.tokenizer = tokenizer
+        self.instance_token = instance_token
 
         # Load metadata: support JSONL and JSON
         jsonl_path = self.data_dir / "metadata.jsonl"
@@ -77,13 +79,16 @@ class FullDataset(Dataset):
                 kws = _as_list(row.get("keywords"))
                 kws = [k for k in kws if k and k != title][:7]
                 if title and kws:
-                    text = f"a pictogram of {title}, {', '.join(kws)}"
+                    text = f"{title}, {', '.join(kws)}"
                 elif title:
-                    text = f"a pictogram of {title}"
+                    text = title
                 elif kws:
-                    text = f"a pictogram: {', '.join(kws)}"
+                    text = ', '.join(kws)
                 else:
-                    text = "a simple pictogram"
+                    raise ValueError(f"Cannot create caption for image {fn}: no text, title, or keywords found")
+
+            # Prepend instance token to the caption
+            text = f"{self.instance_token} {text}"
 
             # store normalized copy (preserve original fields too)
             nr = dict(row)
@@ -95,10 +100,10 @@ class FullDataset(Dataset):
             raise ValueError("No valid samples found after normalizing metadata.")
 
         print(f"Loaded {len(self.data)} training samples")
-		
-    def __len__(self): 
+
+    def __len__(self):
         return len(self.data)
-		
+
     def __getitem__(self, idx):
         import numpy as np  # safe local import
         item = self.data[idx]
@@ -160,6 +165,17 @@ def train(args):
     if args.seed is not None:
         set_seed(args.seed)
 
+    # Initialize W&B
+    if accelerator.is_main_process and not args.no_wandb:
+        wandb.init(
+            entity=args.wandb_entity,
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+            tags=["lora", "stable-diffusion", "arasaac"]
+        )
+        print(f"W&B run initialized: {wandb.run.name}")
+
     # Load models
     print("Loading models...")
     tokenizer = CLIPTokenizer.from_pretrained(
@@ -199,6 +215,16 @@ def train(args):
     unet = get_peft_model(unet, lora_config)
     unet.print_trainable_parameters()
 
+    # Log trainable parameters to W&B
+    if accelerator.is_main_process and not args.no_wandb:
+        trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in unet.parameters())
+        wandb.config.update({
+            "trainable_parameters": trainable_params,
+            "total_parameters": total_params,
+            "trainable_percentage": 100 * trainable_params / total_params
+        })
+
     # Setup noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -210,7 +236,8 @@ def train(args):
     train_dataset = FullDataset(
         args.data_dir,
         tokenizer,
-        size=args.resolution
+        size=args.resolution,
+        instance_token=args.instance_token
     )
 
     train_dataloader = DataLoader(
@@ -264,6 +291,8 @@ def train(args):
 
     for epoch in range(args.num_train_epochs):
         unet.train()
+        epoch_loss = 0.0
+        epoch_steps = 0
 
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
@@ -298,7 +327,9 @@ def train(args):
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    grad_norm = accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                else:
+                    grad_norm = None
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -308,28 +339,98 @@ def train(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                epoch_loss += loss.detach().item()
+                epoch_steps += 1
 
                 # Log metrics
                 if global_step % args.logging_steps == 0:
+                    current_lr = lr_scheduler.get_last_lr()[0]
                     logs = {
-                        "loss": loss.detach().item(),
-                        "lr": lr_scheduler.get_last_lr()[0]
+                        "train/loss": loss.detach().item(),
+                        "train/learning_rate": current_lr,
+                        "train/epoch": epoch,
+                        "train/global_step": global_step,
                     }
-                    progress_bar.set_postfix(**logs)
 
-                # Save checkpoint
+                    if grad_norm is not None:
+                        logs["train/grad_norm"] = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
+
+                    progress_bar.set_postfix(**{"loss": logs["train/loss"], "lr": logs["train/learning_rate"]})
+
+                    # Log to W&B
+                    if accelerator.is_main_process and not args.no_wandb:
+                        wandb.log(logs, step=global_step)
+
+                # Save checkpoint and run validation
                 if global_step % args.save_steps == 0:
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     save_lora_weights(accelerator, unet, save_path)
 
+                    # Generate validation images
+                    if accelerator.is_main_process:
+                        print(f"\n{'='*50}")
+                        print(f"Running validation at step {global_step}")
+                        print(f"{'='*50}")
+
+                        validation_images = generate_validation_images(
+                            unet=unet,
+                            vae=vae,
+                            text_encoder=text_encoder,
+                            tokenizer=tokenizer,
+                            noise_scheduler=noise_scheduler,
+                            accelerator=accelerator,
+                            instance_token=args.instance_token,
+                            validation_prompts=args.validation_prompts,
+                            num_inference_steps=args.num_inference_steps,
+                            guidance_scale=args.guidance_scale,
+                            seed=args.seed
+                        )
+
+                        # Save validation images locally
+                        val_dir = os.path.join(args.output_dir, f"validation-{global_step}")
+                        os.makedirs(val_dir, exist_ok=True)
+
+                        for prompt, image in validation_images:
+                            # Clean prompt for filename (remove instance token and special chars)
+                            clean_prompt = prompt.replace(args.instance_token, "").strip()
+                            clean_prompt = "".join(c if c.isalnum() else "_" for c in clean_prompt)
+                            image_path = os.path.join(val_dir, f"{clean_prompt}.png")
+                            image.save(image_path)
+                            print(f"Saved validation image: {image_path}")
+
+                        # Log to W&B
+                        if not args.no_wandb:
+                            wandb_images = [
+                                wandb.Image(image, caption=prompt)
+                                for prompt, image in validation_images
+                            ]
+                            wandb.log({
+                                "validation/images": wandb_images,
+                                "train/checkpoint_saved": global_step
+                            }, step=global_step)
+
+                        print(f"{'='*50}\n")
+
             if global_step >= args.max_train_steps:
                 break
+
+        # Log epoch metrics
+        if epoch_steps > 0 and accelerator.is_main_process and not args.no_wandb:
+            avg_epoch_loss = epoch_loss / epoch_steps
+            wandb.log({
+                "train/epoch_loss": avg_epoch_loss,
+                "train/epoch_num": epoch
+            }, step=global_step)
 
     # Save final model
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         save_path = os.path.join(args.output_dir, "final")
         save_lora_weights(accelerator, unet, save_path)
+
+        # Finish W&B run
+        if not args.no_wandb:
+            wandb.finish()
 
     print("Training complete!")
 
@@ -342,6 +443,113 @@ def save_lora_weights(accelerator, model, save_path):
     unwrapped_model.save_pretrained(save_path)
 
     print(f"Saved LoRA weights to {save_path}")
+
+
+def generate_validation_images(
+    unet,
+    vae,
+    text_encoder,
+    tokenizer,
+    noise_scheduler,
+    accelerator,
+    instance_token,
+    validation_prompts=None,
+    num_inference_steps=50,
+    guidance_scale=7.5,
+    seed=42
+):
+    """Generate validation images for monitoring training progress."""
+    if validation_prompts is None:
+        validation_prompts = ["school", "train", "camp", "mother", "basketball"]
+
+    # Prepend instance token to all prompts
+    validation_prompts = [f"{instance_token} {prompt}" for prompt in validation_prompts]
+
+    print(f"Generating validation images for prompts: {validation_prompts}")
+
+    # Set models to eval mode
+    unet.eval()
+    text_encoder.eval()
+    vae.eval()
+
+    # Store generated images
+    generated_images = []
+
+    # Set seed for reproducibility
+    generator = torch.Generator(device=accelerator.device).manual_seed(seed)
+
+    with torch.no_grad():
+        for prompt in validation_prompts:
+            # Tokenize prompt
+            text_input = tokenizer(
+                prompt,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            text_embeddings = text_encoder(text_input.input_ids.to(accelerator.device))[0]
+
+            # Prepare unconditional embeddings for classifier-free guidance
+            uncond_input = tokenizer(
+                "",
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                return_tensors="pt",
+            )
+            uncond_embeddings = text_encoder(uncond_input.input_ids.to(accelerator.device))[0]
+
+            # Concatenate for classifier-free guidance
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+
+            # Prepare latents
+            latents = torch.randn(
+                (1, unet.config.in_channels, 64, 64),
+                generator=generator,
+                device=accelerator.device,
+                dtype=text_embeddings.dtype
+            )
+
+            # Set timesteps
+            noise_scheduler.set_timesteps(num_inference_steps, device=accelerator.device)
+            latents = latents * noise_scheduler.init_noise_sigma
+
+            # Denoising loop
+            for t in noise_scheduler.timesteps:
+                # Expand latents for classifier-free guidance
+                latent_model_input = torch.cat([latents] * 2)
+                latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
+
+                # Predict noise residual
+                noise_pred = unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings
+                ).sample
+
+                # Perform classifier-free guidance
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # Compute previous latent
+                latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+
+            # Decode latents to image
+            latents = latents / vae.config.scaling_factor
+            image = vae.decode(latents).sample
+
+            # Convert to PIL Image
+            image = (image / 2 + 0.5).clamp(0, 1)
+            image = image.cpu().permute(0, 2, 3, 1).float().numpy()[0]
+            image = (image * 255).round().astype("uint8")
+            pil_image = Image.fromarray(image)
+
+            generated_images.append((prompt, pil_image))
+
+    # Set models back to train mode
+    unet.train()
+
+    return generated_images
 
 
 def parse_args():
@@ -367,6 +575,12 @@ def parse_args():
         type=int,
         default=512,
         help="Training resolution"
+    )
+    parser.add_argument(
+        "--instance_token",
+        type=str,
+        default="sks",
+        help="Rare token to trigger the learned style (default: sks)"
     )
 
     # LoRA arguments
@@ -464,6 +678,52 @@ def parse_args():
         type=int,
         default=500,
         help="Save checkpoint every N steps"
+    )
+
+    # Validation arguments
+    parser.add_argument(
+        "--validation_prompts",
+        type=str,
+        nargs="+",
+        default=["school", "train", "camp", "mother"],
+        help="Prompts to use for validation image generation"
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=50,
+        help="Number of denoising steps for validation image generation"
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=7.5,
+        help="Guidance scale for validation image generation"
+    )
+
+    # W&B arguments
+    parser.add_argument(
+        "--no_wandb",
+        action="store_true",
+        help="Disable Weights & Biases logging"
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="arasaac-lora",
+        help="W&B project name"
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="W&B entity (team or username)"
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="W&B run name (auto-generated if not provided)"
     )
 
     return parser.parse_args()

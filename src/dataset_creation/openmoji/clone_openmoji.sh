@@ -1,12 +1,13 @@
 #!/bin/bash
 
-cd ../../../data
 
+# Specify directory
+cd /work/courses/dslab/team4/easyread_project/data
 # Clone OpenMoji repo without checking out files
 git clone --no-checkout https://github.com/hfg-gmuend/openmoji.git openmoji
 
 # Go inside the folder
-cd openmoji-lite || exit
+cd openmoji || exit
 
 # Initialize sparse checkout
 git sparse-checkout init --cone
@@ -17,6 +18,6 @@ git sparse-checkout set color data src
 # Checkout files
 git checkout
 
-echo "✅ Done! Only 'color', 'data', and 'src' folders were cloned into openmoji-lite/"
+echo "✅ Done! Only 'color', 'data', and 'src' folders were cloned into openmoji/"
 
 cd ../../src/dataset_creation/openmoji

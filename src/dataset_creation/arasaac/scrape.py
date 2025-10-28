@@ -300,10 +300,12 @@ def main():
                         help="Use HEAD-probing fallback if the API list fails (inclusive range).")
     parser.add_argument("--limit", type=int, default=0, help="Max ids to process (0=all)")
     parser.add_argument("--resume", action="store_true", help="Reuse existing files and append/update metadata")
+    parser.add_argument("--output-dir", type=str, help="Output directory for downloaded files (default: ../../../data/arasaac)")
     args = parser.parse_args()
 
     lang = args.lang.strip() or LANG
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output_dir).resolve() if args.output_dir else OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     s = make_session()
 
     print("[INFO] Fetching ARASAAC catalog …")
@@ -321,10 +323,10 @@ def main():
         ids = ids[: args.limit]
 
     print(f"[INFO] Catalog size: {len(ids):,} pictograms")
-    (OUT_DIR / "catalog_ids.json").write_text(json.dumps(ids, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "catalog_ids.json").write_text(json.dumps(ids, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    meta_json_path = OUT_DIR / "metadata.json"
-    meta_csv_path = OUT_DIR / "metadata.csv"
+    meta_json_path = out_dir / "metadata.json"
+    meta_csv_path = out_dir / "metadata.csv"
     meta_map: Dict[int, Dict[str, Any]] = {}
 
     # Load existing metadata if resuming
@@ -355,12 +357,12 @@ def main():
             meta_map[pid].setdefault("image_file", None)
             meta_map[pid].setdefault("image_url", None)
 
-        ok_dl, saved_path, source_url = download_one(s, pid, OUT_DIR)
+        ok_dl, saved_path, source_url = download_one(s, pid, out_dir)
         if ok_dl:
             ok += 1
             # record actual file path + url
             if saved_path:
-                meta_map[pid]["image_file"] = str(saved_path.relative_to(OUT_DIR)).replace("\\", "/")
+                meta_map[pid]["image_file"] = str(saved_path.relative_to(out_dir)).replace("\\", "/")
             if source_url:
                 meta_map[pid]["image_url"] = source_url
             if ok % 50 == 0:
@@ -378,7 +380,7 @@ def main():
     # final save
     save_metadata(meta_json_path, meta_csv_path, meta_map)
 
-    print(f"[DONE] Saved {ok:,} pictograms to {OUT_DIR}")
+    print(f"[DONE] Saved {ok:,} pictograms to {out_dir}")
     if fail:
         print(f"[WARN] {fail:,} pictograms could not be downloaded.")
     print(f"[DONE] Metadata -> {meta_json_path} and {meta_csv_path}")

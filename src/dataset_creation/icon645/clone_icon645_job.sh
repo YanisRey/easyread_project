@@ -4,8 +4,7 @@
 #SBATCH --error=clone_icon645.err
 #SBATCH --partition=inf-train
 #SBATCH --time=12:00:00
-#SBATCH --account=dslab
-#SBATCH --qos=ymerzouki-dslab
+#SBATCH --account=dslab_jobs
 
 echo "Starting clone_icon645 job on $(hostname)"
 bash clone_icon645.sh
